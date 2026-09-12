@@ -87,6 +87,21 @@
       <artifactId>spring-boot-starter-test</artifactId>
       <scope>test</scope>
     </dependency>
+
+    <!-- Structured JSON console logging -->
+    <dependency>
+      <groupId>net.logstash.logback</groupId>
+      <artifactId>logstash-logback-encoder</artifactId>
+      <version>8.0</version>
+    </dependency>
+    <!-- Exposes Actuator/Micrometer metrics in Prometheus text format at
+         /actuator/prometheus (request rate/latency/error rate come from
+         Spring's auto-instrumented http.server.requests timer; domain
+         counters are added explicitly in the service layer). -->
+    <dependency>
+      <groupId>io.micrometer</groupId>
+      <artifactId>micrometer-registry-prometheus</artifactId>
+    </dependency>
   </dependencies>
 
   <build>

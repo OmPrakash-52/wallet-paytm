@@ -6,6 +6,9 @@ import com.wallet.entity.Transfer;
 import com.wallet.entity.TransferStatus;
 import com.wallet.repository.TransferRepository;
 import com.wallet.service.TransferService;
+import io.micrometer.core.instrument.MeterRegistry;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
@@ -16,15 +19,24 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 
+import static net.logstash.logback.argument.StructuredArguments.kv;
+
 @Service
 public class TransferServiceImpl implements TransferService {
 
+    private static final Logger log = LoggerFactory.getLogger(TransferServiceImpl.class);
+
     private final TransferRepository transferRepository;
     private final TransferTxHelper transferTxHelper;
+    private final MeterRegistry meterRegistry;
 
-    public TransferServiceImpl(TransferRepository transferRepository, TransferTxHelper transferTxHelper) {
+    public TransferServiceImpl(
+            TransferRepository transferRepository,
+            TransferTxHelper transferTxHelper,
+            MeterRegistry meterRegistry) {
         this.transferRepository = transferRepository;
         this.transferTxHelper = transferTxHelper;
+        this.meterRegistry = meterRegistry;
     }
 
     @Override
@@ -58,9 +70,25 @@ public class TransferServiceImpl implements TransferService {
                                     + request.getIdempotencyKey()));
 
             if (!existing.getRequestHash().equals(requestHash)) {
+                log.warn("idempotency_key_conflict",
+                        kv("event", "idempotency_key_conflict"),
+                        kv("idempotencyKey", request.getIdempotencyKey()),
+                        kv("existingTransferId", existing.getId()));
+
                 throw new ResponseStatusException(HttpStatus.CONFLICT,
                         "idempotency_key already used with a different request body");
             }
+
+            log.info("idempotent_replay",
+                    kv("event", "idempotent_replay"),
+                    kv("idempotencyKey", request.getIdempotencyKey()),
+                    kv("transferId", existing.getId()),
+                    kv("status", existing.getStatus()));
+            // No explicit "_total" here either - Micrometer appends the
+            // Prometheus counter suffix itself (see TransferTxHelper for why
+            // adding it manually can collide with Prometheus's reserved
+            // "_created" convention).
+            meterRegistry.counter("wallet_idempotent_replays").increment();
 
             return mapToResponse(existing);
         }
