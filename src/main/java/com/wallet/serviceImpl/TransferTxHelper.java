@@ -5,10 +5,15 @@ import com.wallet.entity.TransferStatus;
 import com.wallet.entity.Wallet;
 import com.wallet.repository.TransferRepository;
 import com.wallet.repository.WalletRepository;
+import io.micrometer.core.instrument.MeterRegistry;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.server.ResponseStatusException;
+
+import static net.logstash.logback.argument.StructuredArguments.kv;
 
 /**
  * Isolated, single-purpose transactional operation for transfers. Kept in its
@@ -20,12 +25,19 @@ import org.springframework.web.server.ResponseStatusException;
 @Component
 public class TransferTxHelper {
 
+    private static final Logger log = LoggerFactory.getLogger(TransferTxHelper.class);
+
     private final TransferRepository transferRepository;
     private final WalletRepository walletRepository;
+    private final MeterRegistry meterRegistry;
 
-    public TransferTxHelper(TransferRepository transferRepository, WalletRepository walletRepository) {
+    public TransferTxHelper(
+            TransferRepository transferRepository,
+            WalletRepository walletRepository,
+            MeterRegistry meterRegistry) {
         this.transferRepository = transferRepository;
         this.walletRepository = walletRepository;
+        this.meterRegistry = meterRegistry;
     }
 
     /**
@@ -59,6 +71,20 @@ public class TransferTxHelper {
 
         Transfer transfer = transferRepository.saveAndFlush(candidate);
 
+        log.info("transfer_created",
+                kv("event", "transfer_created"),
+                kv("transferId", transfer.getId()),
+                kv("fromWalletId", transfer.getFromWalletId()),
+                kv("toWalletId", transfer.getToWalletId()),
+                kv("amountPaise", transfer.getAmountPaise()));
+        // Avoid the literal word "created" anywhere in a counter name -
+        // Micrometer's Prometheus naming convention strips it outright
+        // (it collides with Prometheus's own auto-generated "*_created"
+        // creation-timestamp companion metric for every counter), silently
+        // collapsing e.g. "wallet_transfers_created" down to
+        // "wallet_transfers". "_initiated" avoids the collision.
+        meterRegistry.counter("wallet_transfers_initiated").increment();
+
         String fromId = transfer.getFromWalletId();
         String toId = transfer.getToWalletId();
 
@@ -75,12 +101,36 @@ public class TransferTxHelper {
 
         if (fromWallet.getBalancePaise() < transfer.getAmountPaise()) {
             transfer.setStatus(TransferStatus.DECLINED_INSUFFICIENT_FUNDS);
+
+            log.info("transfer_declined_insufficient_funds",
+                    kv("event", "transfer_declined_insufficient_funds"),
+                    kv("transferId", transfer.getId()),
+                    kv("fromWalletId", fromId),
+                    kv("availableBalancePaise", fromWallet.getBalancePaise()),
+                    kv("requestedAmountPaise", transfer.getAmountPaise()));
+            // No explicit "_total" here either, for the same reason - let
+            // Micrometer append the Prometheus counter suffix itself.
+            meterRegistry.counter("wallet_transfers_declined_insufficient_funds").increment();
         } else {
             fromWallet.setBalancePaise(fromWallet.getBalancePaise() - transfer.getAmountPaise());
             toWallet.setBalancePaise(toWallet.getBalancePaise() + transfer.getAmountPaise());
             walletRepository.save(fromWallet);
             walletRepository.save(toWallet);
             transfer.setStatus(TransferStatus.COMPLETED);
+
+            log.info("wallet_debited",
+                    kv("event", "wallet_debited"),
+                    kv("transferId", transfer.getId()),
+                    kv("walletId", fromWallet.getId()),
+                    kv("amountPaise", transfer.getAmountPaise()),
+                    kv("newBalancePaise", fromWallet.getBalancePaise()));
+
+            log.info("wallet_credited",
+                    kv("event", "wallet_credited"),
+                    kv("transferId", transfer.getId()),
+                    kv("walletId", toWallet.getId()),
+                    kv("amountPaise", transfer.getAmountPaise()),
+                    kv("newBalancePaise", toWallet.getBalancePaise()));
         }
 
         return transferRepository.save(transfer);

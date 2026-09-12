@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+
+    <!-- Structured JSON to stdout. Includes the correlationId MDC value (see
+         CorrelationIdFilter) and any structured key-value fields logged via
+         net.logstash.logback.argument.StructuredArguments.kv(...) for domain
+         events (transfer_created, wallet_debited, wallet_credited,
+         transfer_declined_insufficient_funds, idempotent_replay). -->
+    <appender name="CONSOLE_JSON" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder class="net.logstash.logback.encoder.LogstashEncoder">
+            <includeMdcKeyName>correlationId</includeMdcKeyName>
+        </encoder>
+    </appender>
+
+    <root level="INFO">
+        <appender-ref ref="CONSOLE_JSON"/>
+    </root>
+
+</configuration>
