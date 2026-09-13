@@ -3,8 +3,11 @@ package com.wallet.controller;
 import com.wallet.dto.LoginRequest;
 import com.wallet.dto.LoginResponse;
 import com.wallet.dto.SignupRequest;
+import com.wallet.dto.SignupResponse;
 import com.wallet.service.UserService;
 import jakarta.validation.Valid;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -21,11 +24,12 @@ public class AuthController {
     }
 
     // POST /auth/signup
-    // Creates a new account and returns a token immediately (so callers don't
-    // need a separate login round-trip right after signing up).
+    // Creates a new account only - no token is issued here. Call /auth/login
+    // separately to authenticate.
     @PostMapping("/signup")
-    public LoginResponse signup(@Valid @RequestBody SignupRequest request) {
-        return userService.signup(request);
+    public ResponseEntity<SignupResponse> signup(@Valid @RequestBody SignupRequest request) {
+        SignupResponse response = userService.signup(request);
+        return ResponseEntity.status(HttpStatus.CREATED).body(response);
     }
 
     // POST /auth/login

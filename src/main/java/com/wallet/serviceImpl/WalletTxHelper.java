@@ -2,9 +2,13 @@ package com.wallet.serviceImpl;
 
 import com.wallet.entity.Wallet;
 import com.wallet.repository.WalletRepository;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
+
+import static net.logstash.logback.argument.StructuredArguments.kv;
 
 /**
  * Isolated, single-purpose transactional operations for wallet creation.
@@ -14,6 +18,8 @@ import org.springframework.transaction.annotation.Transactional;
  */
 @Component
 public class WalletTxHelper {
+
+    private static final Logger log = LoggerFactory.getLogger(WalletTxHelper.class);
 
     private final WalletRepository walletRepository;
 
@@ -44,6 +50,13 @@ public class WalletTxHelper {
         Wallet wallet = new Wallet();
         wallet.setUserId(userId);
         wallet.setBalancePaise(0L);
-        return walletRepository.saveAndFlush(wallet);
+        Wallet created = walletRepository.saveAndFlush(wallet);
+
+        log.info("wallet_created",
+                kv("event", "wallet_created"),
+                kv("walletId", created.getId()),
+                kv("userId", created.getUserId()));
+
+        return created;
     }
 }

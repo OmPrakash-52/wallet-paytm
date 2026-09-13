@@ -20,10 +20,9 @@ public class OpenApiConfig {
                         .title("Wallet & P2P Transfer API")
                         .description(
                                 "Get-or-create wallets and move money between them (integer paise). "
-                                        + "Call POST /auth/signup once to create an account (returns a token "
-                                        + "immediately), or POST /auth/login on an existing account. Use the "
-                                        + "Authorize button below with that token - its subject is the caller's "
-                                        + "user id.")
+                                        + "Call POST /auth/signup once to create an account, then POST /auth/login "
+                                        + "with the same credentials to get a token. Use the Authorize button below "
+                                        + "with that token - its subject is the caller's user id.")
                         .version("v1"))
                 .addSecurityItem(new SecurityRequirement().addList(BEARER_SCHEME))
                 .components(new Components()

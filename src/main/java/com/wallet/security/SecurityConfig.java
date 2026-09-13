@@ -22,7 +22,8 @@ public class SecurityConfig {
             "/actuator/health/**",
             "/actuator/info",
             "/actuator/metrics/**",
-            "/actuator/prometheus"
+            "/actuator/prometheus",
+            "/metrics"
     };
 
     @Bean

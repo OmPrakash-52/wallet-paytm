@@ -9,11 +9,11 @@ import lombok.Setter;
 @Setter
 @NoArgsConstructor
 @AllArgsConstructor
-public class CreateWalletResponse {
+public class SignupResponse {
 
-    private String walletId;
+    private String userId;
 
-    private Long balancePaise;
+    private String username;
 
     private String message;
 }
