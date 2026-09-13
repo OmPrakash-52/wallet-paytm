@@ -1,17 +1,37 @@
 services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: wallet
+      POSTGRES_USER: wallet
+      POSTGRES_PASSWORD: wallet
+    volumes:
+      - wallet-db-data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wallet -d wallet"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
   app:
     build:
       context: .
       dockerfile: Dockerfile
     restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
     environment:
-      # host.docker.internal lets the container reach Postgres running on
-      # your host machine (Docker Desktop resolves this automatically on
-      # Windows/Mac). Override any of these if your local instance differs.
-      DB_URL: ${DB_URL:-jdbc:postgresql://host.docker.internal:5432/wallet}
-      DB_USER: ${DB_USER:-postgres}
-      DB_PASSWORD: ${DB_PASSWORD:-abcd@123}
-      JWT_SECRET: dev-only-change-me-please-32-bytes-minimum-for-hs256
-      JWT_EXPIRATION_MS: 3600000
+      DB_URL: ${DB_URL:-jdbc:postgresql://postgres:5432/wallet}
+      DB_USER: ${DB_USER:-wallet}
+      DB_PASSWORD: ${DB_PASSWORD:-wallet}
+      JWT_SECRET: ${JWT_SECRET:-dev-only-change-me-please-32-bytes-minimum-for-hs256}
+      JWT_EXPIRATION_MS: ${JWT_EXPIRATION_MS:-3600000}
     ports:
       - "${APP_PORT:-8081}:8080"
+
+volumes:
+  wallet-db-data:

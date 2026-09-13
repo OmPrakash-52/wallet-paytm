@@ -97,9 +97,18 @@ def signup(username, password, phone_number):
     status, body = api("POST", "/auth/signup", body={
         "username": username, "password": password, "phoneNumber": phone_number,
     })
-    if status != 200:
+    if status != 201:
         raise RuntimeError(f"signup failed for {username}: {status} {body}")
-    return body  # { userId, token, tokenType, expiresInMs }
+
+    # Signup only confirms account creation - it doesn't issue a token.
+    # Log in right after to get one, same as any real client would.
+    login_status, login_body = api("POST", "/auth/login", body={
+        "username": username, "password": password,
+    })
+    if login_status != 200:
+        raise RuntimeError(f"login after signup failed for {username}: {login_status} {login_body}")
+
+    return login_body  # { userId, token, tokenType, expiresInMs }
 
 
 def signup_fresh_user(prefix):
@@ -226,7 +235,132 @@ def test_idempotent_retry_storm():
 
 
 # ---------------------------------------------------------------------------
-# 3. Conservation under contention
+# 3. Insufficient-funds decline
+# ---------------------------------------------------------------------------
+def test_insufficient_funds_decline():
+    section("Insufficient-funds decline (overdraft attempt on a zero-balance wallet)")
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        user_a_f = pool.submit(signup_fresh_user, "nsf-a")
+        user_b_f = pool.submit(signup_fresh_user, "nsf-b")
+        user_a, user_b = user_a_f.result(), user_b_f.result()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        wallet_a_f = pool.submit(create_wallet, user_a["token"])
+        wallet_b_f = pool.submit(create_wallet, user_b["token"])
+        wallet_a, wallet_b = wallet_a_f.result(), wallet_b_f.result()
+
+    wallet_a_id = wallet_a[1]["walletId"]
+    wallet_b_id = wallet_b[1]["walletId"]
+
+    # Deliberately no deposit - wallet A stays at 0 balance.
+    amount_paise = 100
+    idempotency_key = f"nsf-{unique_suffix()}"
+
+    status, body = transfer(user_a["token"], wallet_a_id, wallet_b_id, amount_paise, idempotency_key)
+
+    if status != 200:
+        bad("expected a clean 200 response (decline is not an error)", f"got {status} {body}")
+        return
+
+    if body.get("status") == "DECLINED_INSUFFICIENT_FUNDS":
+        ok("transfer declined cleanly", f"transferId={body.get('transferId')}")
+    else:
+        bad("expected status DECLINED_INSUFFICIENT_FUNDS", f"got {body.get('status')}")
+
+    # No partial apply: neither wallet's balance should have moved at all.
+    final_a = get_wallet(user_a["token"], wallet_a_id)
+    final_b = get_wallet(user_a["token"], wallet_b_id)
+
+    if final_a["balancePaise"] == 0 and final_b["balancePaise"] == 0:
+        ok("no balance changed on decline", f"A={final_a['balancePaise']} paise, B={final_b['balancePaise']} paise")
+    else:
+        bad(
+            "expected both balances unchanged at 0",
+            f"A={final_a['balancePaise']}, B={final_b['balancePaise']} - a declined transfer must never move money",
+        )
+
+
+# ---------------------------------------------------------------------------
+# 4. Opposite-direction concurrency (A->B and B->A at once, same 2 wallets)
+# ---------------------------------------------------------------------------
+# "Conservation under contention" below picks random wallet pairs out of a
+# larger set, so A->B and B->A landing on the exact same pair at the exact
+# same instant only happens by chance. This test makes that scenario
+# deterministic - it fires A->B and B->A transfers between the same two
+# wallets simultaneously, which is exactly what requires the sorted-lock-
+# order deadlock avoidance (see TransferTxHelper.createAndSettle) - if that
+# logic were wrong, this would hang/timeout or the DB would report a
+# deadlock, instead of every request just cleanly resolving.
+OPPOSITE_DIRECTION_PAIRS = int(os.environ.get("OPPOSITE_DIRECTION_PAIRS", "10"))
+
+
+def test_opposite_direction_concurrency():
+    section(
+        f"Opposite-direction concurrency ({OPPOSITE_DIRECTION_PAIRS * 2} simultaneous transfers, "
+        f"A->B and B->A on the same 2 wallets)"
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        user_a_f = pool.submit(signup_fresh_user, "oppo-a")
+        user_b_f = pool.submit(signup_fresh_user, "oppo-b")
+        user_a, user_b = user_a_f.result(), user_b_f.result()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        wallet_a_f = pool.submit(create_wallet, user_a["token"])
+        wallet_b_f = pool.submit(create_wallet, user_b["token"])
+        wallet_a, wallet_b = wallet_a_f.result(), wallet_b_f.result()
+
+    wallet_a_id = wallet_a[1]["walletId"]
+    wallet_b_id = wallet_b[1]["walletId"]
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(lambda args: deposit(*args), [
+            (user_a["token"], wallet_a_id, INITIAL_DEPOSIT_PAISE),
+            (user_b["token"], wallet_b_id, INITIAL_DEPOSIT_PAISE),
+        ]))
+
+    initial_total = INITIAL_DEPOSIT_PAISE * 2
+
+    jobs = []
+    for i in range(OPPOSITE_DIRECTION_PAIRS):
+        amount_paise = 100 + random.randrange(2000)
+        jobs.append((user_a["token"], wallet_a_id, wallet_b_id, amount_paise, f"oppo-ab-{unique_suffix()}-{i}"))
+        jobs.append((user_b["token"], wallet_b_id, wallet_a_id, amount_paise, f"oppo-ba-{unique_suffix()}-{i}"))
+
+    with ThreadPoolExecutor(max_workers=len(jobs)) as pool:
+        results = list(pool.map(lambda job: transfer(*job), jobs))
+
+    http_failures = [r for r in results if r[0] != 200]
+    if http_failures:
+        bad(
+            "all A<->B transfers returned 200 (a deadlock would show up here as a hang, timeout, or DB error)",
+            f"{len(http_failures)} non-200 responses: {http_failures[0]}",
+        )
+    else:
+        completed = sum(1 for _, body in results if body.get("status") == "COMPLETED")
+        declined = sum(1 for _, body in results if body.get("status") == "DECLINED_INSUFFICIENT_FUNDS")
+        ok("no deadlock - all simultaneous opposite-direction transfers resolved cleanly", f"{completed} completed, {declined} declined")
+
+    final_a = get_wallet(user_a["token"], wallet_a_id)
+    final_b = get_wallet(user_a["token"], wallet_b_id)
+
+    final_total = final_a["balancePaise"] + final_b["balancePaise"]
+    any_negative = final_a["balancePaise"] < 0 or final_b["balancePaise"] < 0
+
+    if final_total == initial_total:
+        ok("total balance conserved across A<->B", f"initial={initial_total}, final={final_total}")
+    else:
+        bad("total balance changed", f"initial={initial_total}, final={final_total}, diff={final_total - initial_total}")
+
+    if not any_negative:
+        ok("neither wallet went negative", f"A={final_a['balancePaise']}, B={final_b['balancePaise']}")
+    else:
+        bad("a wallet balance went negative", f"A={final_a['balancePaise']}, B={final_b['balancePaise']}")
+
+
+# ---------------------------------------------------------------------------
+# 5. Conservation under contention
 # ---------------------------------------------------------------------------
 def test_conservation_under_contention():
     section(
@@ -295,6 +429,8 @@ def main():
 
     test_concurrent_get_or_create()
     test_idempotent_retry_storm()
+    test_insufficient_funds_decline()
+    test_opposite_direction_concurrency()
     test_conservation_under_contention()
 
     print(f"\n{_pass_count} passed, {_fail_count} failed")

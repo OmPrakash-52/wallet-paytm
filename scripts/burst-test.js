@@ -81,10 +81,20 @@ async function signup(username, password, phoneNumber) {
     const { status, body } = await api("POST", "/auth/signup", {
         body: { username, password, phoneNumber },
     });
-    if (status !== 200) {
+    if (status !== 201) {
         throw new Error(`signup failed for ${username}: ${status} ${JSON.stringify(body)}`);
     }
-    return body; // { userId, token, tokenType, expiresInMs }
+
+    // Signup only confirms account creation - it doesn't issue a token.
+    // Log in right after to get one, same as any real client would.
+    const { status: loginStatus, body: loginBody } = await api("POST", "/auth/login", {
+        body: { username, password },
+    });
+    if (loginStatus !== 200) {
+        throw new Error(`login after signup failed for ${username}: ${loginStatus} ${JSON.stringify(loginBody)}`);
+    }
+
+    return loginBody; // { userId, token, tokenType, expiresInMs }
 }
 
 async function signupFreshUser(prefix) {
@@ -228,7 +238,141 @@ async function testIdempotentRetryStorm() {
 }
 
 // ---------------------------------------------------------------------------
-// 3. Conservation under contention
+// 3. Insufficient-funds decline
+// ---------------------------------------------------------------------------
+async function testInsufficientFundsDecline() {
+    section("Insufficient-funds decline (overdraft attempt on a zero-balance wallet)");
+
+    const [userA, userB] = await Promise.all([
+        signupFreshUser("nsf-a"),
+        signupFreshUser("nsf-b"),
+    ]);
+
+    const [walletA, walletB] = await Promise.all([
+        createWallet(userA.token),
+        createWallet(userB.token),
+    ]);
+
+    // Deliberately no deposit - wallet A stays at 0 balance.
+    const amountPaise = 100;
+    const idempotencyKey = `nsf-${uniqueSuffix()}`;
+
+    const result = await transfer(userA.token, walletA.body.walletId, walletB.body.walletId, amountPaise, idempotencyKey);
+
+    if (result.status !== 200) {
+        fail("expected a clean 200 response (decline is not an error)", `got ${result.status} ${JSON.stringify(result.body)}`);
+        return;
+    }
+
+    if (result.body.status === "DECLINED_INSUFFICIENT_FUNDS") {
+        pass("transfer declined cleanly", `transferId=${result.body.transferId}`);
+    } else {
+        fail("expected status DECLINED_INSUFFICIENT_FUNDS", `got ${result.body.status}`);
+    }
+
+    // No partial apply: neither wallet's balance should have moved at all.
+    const [finalA, finalB] = await Promise.all([
+        getWallet(userA.token, walletA.body.walletId),
+        getWallet(userA.token, walletB.body.walletId),
+    ]);
+
+    if (finalA.balancePaise === 0 && finalB.balancePaise === 0) {
+        pass("no balance changed on decline", `A=${finalA.balancePaise} paise, B=${finalB.balancePaise} paise`);
+    } else {
+        fail(
+            "expected both balances unchanged at 0",
+            `A=${finalA.balancePaise}, B=${finalB.balancePaise} - a declined transfer must never move money`
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 4. Opposite-direction concurrency (A->B and B->A at once, same 2 wallets)
+// ---------------------------------------------------------------------------
+// The "Conservation under contention" test below picks random wallet pairs
+// out of a larger set, so A->B and B->A landing on the exact same pair at
+// the exact same instant only happens by chance. This test makes that
+// scenario deterministic: it fires A->B and B->A transfers between the same
+// two wallets simultaneously, which is exactly what requires the
+// sorted-lock-order deadlock avoidance (see TransferTxHelper.createAndSettle)
+// - if that logic were wrong, this would hang/timeout or the DB would report
+// a deadlock, instead of every request just cleanly resolving.
+const OPPOSITE_DIRECTION_PAIRS = Number(process.env.OPPOSITE_DIRECTION_PAIRS || 10);
+
+async function testOppositeDirectionConcurrency() {
+    section(
+        `Opposite-direction concurrency (${OPPOSITE_DIRECTION_PAIRS * 2} simultaneous transfers, A->B and B->A on the same 2 wallets)`
+    );
+
+    const [userA, userB] = await Promise.all([
+        signupFreshUser("oppo-a"),
+        signupFreshUser("oppo-b"),
+    ]);
+
+    const [walletA, walletB] = await Promise.all([
+        createWallet(userA.token),
+        createWallet(userB.token),
+    ]);
+
+    const walletAId = walletA.body.walletId;
+    const walletBId = walletB.body.walletId;
+
+    // Fund both sides so transfers in either direction can actually complete,
+    // not just decline for lack of balance.
+    await Promise.all([
+        deposit(userA.token, walletAId, INITIAL_DEPOSIT_PAISE),
+        deposit(userB.token, walletBId, INITIAL_DEPOSIT_PAISE),
+    ]);
+
+    const initialTotal = INITIAL_DEPOSIT_PAISE * 2;
+
+    // Interleave A->B and B->A jobs, then fire all of them at once - this is
+    // the part that specifically exercises two transfers locking the same
+    // two wallets in opposite orders at the same time.
+    const jobs = [];
+    for (let i = 0; i < OPPOSITE_DIRECTION_PAIRS; i++) {
+        const amountPaise = 100 + Math.floor(Math.random() * 2000);
+        jobs.push(transfer(userA.token, walletAId, walletBId, amountPaise, `oppo-ab-${uniqueSuffix()}-${i}`));
+        jobs.push(transfer(userB.token, walletBId, walletAId, amountPaise, `oppo-ba-${uniqueSuffix()}-${i}`));
+    }
+
+    const results = await Promise.all(jobs);
+
+    const httpFailures = results.filter((r) => r.status !== 200);
+    if (httpFailures.length > 0) {
+        fail(
+            "all A<->B transfers returned 200 (a deadlock would show up here as a hang, timeout, or DB error)",
+            `${httpFailures.length} non-200 responses: ${JSON.stringify(httpFailures[0])}`
+        );
+    } else {
+        const completed = results.filter((r) => r.body.status === "COMPLETED").length;
+        const declined = results.filter((r) => r.body.status === "DECLINED_INSUFFICIENT_FUNDS").length;
+        pass("no deadlock - all simultaneous opposite-direction transfers resolved cleanly", `${completed} completed, ${declined} declined`);
+    }
+
+    const [finalA, finalB] = await Promise.all([
+        getWallet(userA.token, walletAId),
+        getWallet(userA.token, walletBId),
+    ]);
+
+    const finalTotal = finalA.balancePaise + finalB.balancePaise;
+    const anyNegative = finalA.balancePaise < 0 || finalB.balancePaise < 0;
+
+    if (finalTotal === initialTotal) {
+        pass("total balance conserved across A<->B", `initial=${initialTotal}, final=${finalTotal}`);
+    } else {
+        fail("total balance changed", `initial=${initialTotal}, final=${finalTotal}, diff=${finalTotal - initialTotal}`);
+    }
+
+    if (!anyNegative) {
+        pass("neither wallet went negative", `A=${finalA.balancePaise}, B=${finalB.balancePaise}`);
+    } else {
+        fail("a wallet balance went negative", `A=${finalA.balancePaise}, B=${finalB.balancePaise}`);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 5. Conservation under contention
 // ---------------------------------------------------------------------------
 async function testConservationUnderContention() {
     section(
@@ -302,6 +446,8 @@ async function main() {
 
     await testConcurrentGetOrCreate();
     await testIdempotentRetryStorm();
+    await testInsufficientFundsDecline();
+    await testOppositeDirectionConcurrency();
     await testConservationUnderContention();
 
     console.log(`\n${passCount} passed, ${failCount} failed`);
